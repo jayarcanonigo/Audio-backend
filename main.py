@@ -32,15 +32,6 @@ def is_ad(t):
     if any(x in t for x in["fb","facebook",".com",".ph"]):s+=2
     return s>=2
 
-def merge(s,seg):
-    tr=s["transcript"]
-    if len(tr)<2:return
-    p=tr[-2]
-    if p["advertisement"] and seg["advertisement"] and seg["start"]-p["end"]<=5:
-        p["end"]=seg["end"]
-        p["text"]+=" "+seg["text"]
-        p["text_tokens"]=norm(p["text"])
-
 def log(sid,msg,start=None,end=None,ad=False):
     if sid not in sessions:return
     with lock:
@@ -54,6 +45,24 @@ def log(sid,msg,start=None,end=None,ad=False):
         })
         sessions[sid]["logs"]=sessions[sid]["logs"][-100:]
 
+# =========================
+# 5-MIN CHUNK SPLITTER (FIXED)
+# =========================
+def split(path,sec=300):
+    out=tempfile.mkdtemp()
+    pat=os.path.join(out,"c_%03d.wav")
+
+    cmd=f'ffmpeg -y -i "{path}" -ar 16000 -ac 1 -f segment -segment_time {sec} -reset_timestamps 1 "{pat}"'
+    os.system(cmd)
+
+    chunks=[]
+    for f in sorted(os.listdir(out)):
+        p=os.path.join(out,f)
+        if os.path.getsize(p)>0:chunks.append(p)
+
+    return chunks,out
+
+# =========================
 def transcribe(path,sid):
     s=sessions.get(sid)
     if not s:return
@@ -62,38 +71,48 @@ def transcribe(path,sid):
         s["progress"]={"status":"transcribing"}
         log(sid,"started")
 
-        segments,info=model.transcribe(path,beam_size=5,vad_filter=True,task="transcribe")
-        log(sid,f"lang {info.language}")
+        chunks,tmp=split(path,300)
+
+        if not chunks:
+            s["progress"]={"status":"error","msg":"no chunks generated"}
+            log(sid,"chunk failed")
+            return
 
         count=0
 
-        for seg in segments:
-            if s.get("stop"):
-                s["progress"]["status"]="stopped"
-                return
+        for c in chunks:
+            segments,info=model.transcribe(c,beam_size=5,vad_filter=True,task="transcribe")
+            log(sid,f"lang {info.language}")
 
-            text=(seg.text or "").strip()
-            if not text:continue
+            for seg in segments:
+                if s.get("stop"):
+                    s["progress"]["status"]="stopped"
+                    return
 
-            count+=1
-            ad=is_ad(text) or check_kw(text,s["keywords"])
+                text=(seg.text or "").strip()
+                if not text:continue
 
-            data={
-                "index":count-1,
-                "start":seg.start,
-                "end":seg.end,
-                "start_time":fmt(seg.start),
-                "end_time":fmt(seg.end),
-                "text":text,
-                "text_tokens":norm(text),
-                "advertisement":ad
-            }
+                count+=1
+                ad=is_ad(text) or check_kw(text,s["keywords"])
 
-            with lock:
-                s["transcript"].append(data)   # FIX: always push segment
-                merge(s,data)
+                data={
+                    "index":count-1,
+                    "start":seg.start,
+                    "end":seg.end,
+                    "start_time":fmt(seg.start),
+                    "end_time":fmt(seg.end),
+                    "text":text,
+                    "text_tokens":norm(text),
+                    "advertisement":ad
+                }
 
-            log(sid,text,fmt(seg.start),fmt(seg.end),ad)
+                with lock:
+                    s["transcript"].append(data)
+                    merge(s,data)
+
+                log(sid,text,fmt(seg.start),fmt(seg.end),ad)
+
+            os.remove(c)
 
         s["progress"]={"status":"completed","total":count}
         log(sid,f"done {count}")
@@ -102,12 +121,24 @@ def transcribe(path,sid):
         try:os.remove(path)
         except:pass
 
+# =========================
+def merge(s,seg):
+    tr=s["transcript"]
+    if len(tr)<2:return
+    p=tr[-2]
+    if p["advertisement"] and seg["advertisement"] and seg["start"]-p["end"]<=5:
+        p["end"]=seg["end"]
+        p["text"]+=" "+seg["text"]
+        p["text_tokens"]=norm(p["text"])
+
+# =========================
 def worker():
     while True:
         path,sid=job_queue.get()
         try:transcribe(path,sid)
         finally:job_queue.task_done()
 
+# =========================
 @app.post("/upload")
 async def upload(file:UploadFile=File(...),keywords:str=Form("")):
     sid=str(uuid.uuid4())
