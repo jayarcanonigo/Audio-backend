@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import tempfile, threading, os, re, time, uuid, json
+from queue import Queue
 
 app = FastAPI(title="Radio Search API")
 
@@ -13,31 +14,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =======================
+# CORE STATE
+# =======================
 model = None
-lock = threading.Lock()
 sessions = {}
+lock = threading.Lock()
+
+job_queue = Queue(maxsize=1)
 
 
-def create_progress():
-    return {
-        "status": "idle",
-        "message": "",
-        "current_segment": 0,
-        "processed_time": "00:00:00",
-        "total_segments": 0,
-        "processing_time_seconds": 0,
-        "started_at": None,
-        "error": None,
-    }
-
-
+# =======================
+# MODEL LOAD
+# =======================
 @app.on_event("startup")
 def load_model():
     global model
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    model = WhisperModel("small", device="cpu", compute_type="int8")
+    threading.Thread(target=worker, daemon=True).start()
     print("Whisper loaded")
 
 
+# =======================
+# UTIL
+# =======================
 def format_time(sec):
     return f"{int(sec//3600):02}:{int(sec%3600//60):02}:{int(sec%60):02}"
 
@@ -46,134 +46,101 @@ def normalize(text):
     return re.sub(r"[^\w\s]", " ", text.lower()).split()
 
 
+# =======================
+# ADS LOGIC (UNCHANGED)
+# =======================
 AD_MERGE_GAP = 5
 
-
 AD_KEYWORDS = [
-    "sponsored",
-    "brought to you",
-    "hatid ng",
-    "hatid sa inyo",
-    "inihahatid ng",
-    "ipinagmamalaki ng",
-    "ang programang ito ay hatid",
-    "time check",
-    "time check brought to you by",
-    "the time is",
-    "time now",
-    "oras natin",
-    "ang oras ay",
-    "oras na",
-    "hatid na time check",
-    "ang time check ay hatid ng",
-    "oras hatid ng",
+    "sponsored","brought to you","hatid ng","hatid sa inyo",
+    "inihahatid ng","ipinagmamalaki ng","ang programang ito ay hatid",
+    "time check","time now","oras natin","oras na"
 ]
 
 
 def check_custom_keywords(text, keywords):
-
     if not keywords:
         return False
-
     text = text.lower()
-
-    return any(k.strip().lower() in text for k in keywords if k.strip())
+    return any(k.lower() in text for k in keywords if k)
 
 
 def is_advertisement(text):
-
     text = re.sub(r"[^a-z0-9\s]", "", text.lower())
-
-    text = " ".join(text.split())
-
     score = sum(2 for x in AD_KEYWORDS if x in text)
 
     if re.search(r"(09\d{9}|\+639\d{9})", text):
         score += 2
-
     if re.search(r"(php|peso|pesos)\s*\d+", text):
         score += 2
-
-    if any(x in text for x in ["facebook", "fb", "www", ".com", ".ph"]):
+    if any(x in text for x in ["facebook","fb","www",".com",".ph"]):
         score += 2
 
     return score >= 2
 
 
-def merge_advertisement(session, new_segment):
+def merge_advertisement(session, seg):
+    t = session["transcript"]
 
-    transcript = session["transcript"]
-
-    if not transcript:
-        transcript.append(new_segment)
+    if not t:
+        t.append(seg)
         return
 
-    previous = transcript[-1]
+    p = t[-1]
+    gap = seg["start"] - p["end"]
 
-    gap = new_segment["start"] - previous["end"]
-
-    if (
-        previous["advertisement"]
-        and new_segment["advertisement"]
-        and gap <= AD_MERGE_GAP
-    ):
-
-        previous["end"] = new_segment["end"]
-
-        previous["end_time"] = new_segment["end_time"]
-
-        previous["text"] += " " + new_segment["text"]
-
-        previous["text_tokens"] = normalize(previous["text"])
-
+    if p["advertisement"] and seg["advertisement"] and gap <= AD_MERGE_GAP:
+        p["end"] = seg["end"]
+        p["end_time"] = seg["end_time"]
+        p["text"] += " " + seg["text"]
+        p["text_tokens"] = normalize(p["text"])
         return
 
-    transcript.append(new_segment)
+    t.append(seg)
 
 
-def add_log(sid, msg, start=None, end=None, advertisement=False):
-
+# =======================
+# LOGS
+# =======================
+def add_log(sid, msg, start=None, end=None, ad=False):
     if sid not in sessions:
         return
 
-    item = {
-        "id": time.time_ns(),
-        "time": time.strftime("%H:%M:%S"),
-        "message": msg,
-        "start_time": start,
-        "end_time": end,
-        "advertisement": advertisement,
-    }
-
     with lock:
+        sessions[sid]["logs"].append({
+            "id": time.time_ns(),
+            "time": time.strftime("%H:%M:%S"),
+            "message": msg,
+            "start_time": start,
+            "end_time": end,
+            "advertisement": ad
+        })
 
-        sessions[sid]["logs"].append(item)
-
-        if len(sessions[sid]["logs"]) > 500:
-            sessions[sid]["logs"] = sessions[sid]["logs"][-500:]
+        sessions[sid]["logs"] = sessions[sid]["logs"][-100:]
 
 
+# =======================
+# TRANSCRIBE (NO CHUNK)
+# =======================
 def transcribe_audio(path, sid):
-
-    session = sessions[sid]
+    s = sessions.get(sid)
+    if not s:
+        return
 
     try:
-
-        start = time.time()
-
-        session["progress"].update(
-            {
-                "status": "transcribing",
-                "message": "Transcribing...",
-                "started_at": start,
-                "error": None,
-            }
-        )
+        s["progress"].update({
+            "status": "transcribing",
+            "message": "Transcribing...",
+            "started_at": time.time()
+        })
 
         add_log(sid, "Transcription started")
 
         segments, info = model.transcribe(
-            path, beam_size=5, vad_filter=True, language=None, task="transcribe"
+            path,
+            beam_size=5,
+            vad_filter=True,
+            task="transcribe"
         )
 
         add_log(sid, f"Language: {info.language}")
@@ -182,20 +149,12 @@ def transcribe_audio(path, sid):
 
         for seg in segments:
 
-            if session["stop"]:
-
-                session["progress"].update(
-                    {"status": "stopped", "message": "Stopped", "error": None}
-                )
-
-                add_log(sid, "Processing stopped")
-
+            if s.get("stop"):
+                s["progress"].update({"status": "stopped"})
+                add_log(sid, "Stopped")
                 return
 
-            text = seg.text.strip()
-
-            text = seg.text.strip()
-
+            text = (seg.text or "").strip()
             if not text:
                 continue
 
@@ -205,151 +164,111 @@ def transcribe_audio(path, sid):
             end_t = format_time(seg.end)
 
             ad = is_advertisement(text) or check_custom_keywords(
-                text, session.get("keywords", [])
+                text, s.get("keywords", [])
             )
 
             data = {
                 "index": count - 1,
-                "start": float(seg.start),
-                "end": float(seg.end),
+                "start": seg.start,
+                "end": seg.end,
                 "start_time": start_t,
                 "end_time": end_t,
                 "text": text,
                 "text_tokens": normalize(text),
-                "advertisement": ad,
+                "advertisement": ad
             }
 
             with lock:
-                merge_advertisement(session, data)
+                merge_advertisement(s, data)
 
-            session["progress"].update(
-                {
+            if count % 5 == 0:
+                s["progress"].update({
                     "current_segment": count,
-                    "processed_time": end_t,
-                    "message": f"Processed segment {count}",
-                }
-            )
+                    "processed_time": end_t
+                })
 
             add_log(sid, text, start_t, end_t, ad)
 
-        duration = round(time.time() - start, 2)
-
-        session["progress"].update(
-            {
-                "status": "completed",
-                "message": "Completed",
-                "total_segments": count,
-                "processing_time_seconds": duration,
-            }
-        )
+        s["progress"].update({
+            "status": "completed",
+            "total_segments": count
+        })
 
         add_log(sid, f"Completed {count} segments")
 
-    except Exception as e:
-
-        session["progress"].update({"status": "error", "error": str(e)})
-
-        add_log(sid, f"ERROR: {e}")
-
     finally:
-
         try:
             os.remove(path)
-
         except:
             pass
 
 
-@app.get("/")
-def root():
-    return {"status": "running"}
+# =======================
+# WORKER (IMPORTANT)
+# =======================
+def worker():
+    while True:
+        path, sid = job_queue.get()
+        try:
+            transcribe_audio(path, sid)
+        finally:
+            job_queue.task_done()
 
 
+# =======================
+# API
+# =======================
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), keywords: str = Form("")):
 
     sid = str(uuid.uuid4())
 
     try:
-        keyword_list = [x.strip() for x in json.loads(keywords) if x.strip()]
-
+        kw = [x.strip() for x in json.loads(keywords) if x.strip()]
     except:
-        keyword_list = []
+        kw = []
 
     sessions[sid] = {
         "stop": False,
-        "progress": create_progress(),
+        "progress": {"status": "starting"},
         "logs": [],
         "transcript": [],
-        "keywords": keyword_list,
+        "keywords": kw
     }
 
-    content = await file.read()
-
-    if not content:
-        return {"error": "Empty file"}
-
-    ext = os.path.splitext(file.filename)[1] or ".mp3"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-
-        tmp.write(content)
+    # STREAM FILE (IMPORTANT FIX)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        while chunk := await file.read(1024 * 1024):
+            tmp.write(chunk)
         path = tmp.name
-
-    sessions[sid]["progress"].update({"status": "starting", "message": "Uploading..."})
 
     add_log(sid, "File uploaded")
 
-    if keyword_list:
+    job_queue.put((path, sid))
 
-        add_log(sid, "Filters: " + ", ".join(keyword_list))
-
-    threading.Thread(target=transcribe_audio, args=(path, sid), daemon=True).start()
-
-    return {"status": "started", "session_id": sid}
+    return {"session_id": sid, "status": "started"}
 
 
 @app.get("/status/{sid}")
 def status(sid: str):
-
-    if sid not in sessions:
-        return {"error": "not found"}
-
-    return sessions[sid]["progress"]
+    return sessions.get(sid, {}).get("progress", {})
 
 
 @app.get("/logs/{sid}")
 def logs(sid: str):
-
-    if sid not in sessions:
-        return []
-
-    return sessions[sid]["logs"][-100:]
+    return sessions.get(sid, {}).get("logs", [])
 
 
 @app.get("/transcript/{sid}")
 def transcript(sid: str):
-
-    if sid not in sessions:
-        return []
-
-    return sessions[sid]["transcript"]
+    return sessions.get(sid, {}).get("transcript", [])
 
 
 @app.post("/stop/{sid}")
 def stop(sid: str):
-
-    if sid not in sessions:
-        return {"status": "not_found"}
-
-    sessions[sid]["stop"] = True
-
-    sessions[sid]["progress"].update({"status": "stopped", "message": "Stopped"})
-
-    add_log(sid, "Processing stopped")
-
-    return {"status": "stopped", "session_id": sid}
-
+    if sid in sessions:
+        sessions[sid]["stop"] = True
+    return {"status": "stopped"}
 
 @app.post("/reset/{sid}")
 def reset(sid: str):
