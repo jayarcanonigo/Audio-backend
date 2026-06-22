@@ -34,7 +34,7 @@ def create_progress():
 @app.on_event("startup")
 def load_model():
     global model
-    model = WhisperModel("medium", device="cpu", compute_type="int8")
+    model = WhisperModel("small", device="cpu", compute_type="int8")
     print("Whisper loaded")
 
 
