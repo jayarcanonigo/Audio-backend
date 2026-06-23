@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from queue import Queue
 import tempfile,threading,os,re,time,uuid,json,subprocess,shutil
+import platform
 
 app=FastAPI()
 
@@ -19,9 +20,12 @@ sessions={}
 lock=threading.Lock()
 job_queue=Queue(maxsize=1)
 
-FFMPEG=shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
+FFMPEG=shutil.which("ffmpeg") or (r"C:\ffmpeg\bin\ffmpeg.EXE" if platform.system()=="Windows" else None)
 
 print("FFMPEG:",FFMPEG)
+
+if not FFMPEG:
+    raise Exception("FFmpeg not found")
 
 
 @app.on_event("startup")
